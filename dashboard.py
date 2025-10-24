@@ -7,6 +7,8 @@ import pandas as pd
 import altair as alt
 import pydeck as pdk
 import streamlit as st
+import numpy as np
+from sklearn.linear_model import LinearRegression
 from components.kpis import render_kpi_cards, KpiValues
 
 # ---------- Config ----------
@@ -32,6 +34,23 @@ st.caption("Serie mensual por año (superpuesta). Base: fecha de actualización.
 # ---------- util ----------
 MESES_MAP = {1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic"}
 MESES_ORD = list(range(1,13))
+
+def detect_peaks(series: pd.Series, threshold: float = 1.5) -> pd.Series:
+    """
+    Detecta picos/anomalías usando desviación estándar.
+
+    Args:
+        series: Serie de datos numéricos (trámites)
+        threshold: Multiplicador de desv. estándar (1.5 = moderado, 2.0 = estricto)
+
+    Returns:
+        Serie booleana: True donde hay anomalía
+    """
+    if series.empty or series.std() == 0:
+        return pd.Series(False, index=series.index)
+    mean = series.mean()
+    std = series.std()
+    return (series - mean).abs() > (threshold * std)
 
 def pct_change_between_two_years(d: pd.DataFrame, y0: int, y1: int, months: list[int]) -> float | None:
     """Variación % entre y0 (base) y y1 (comparado) usando SOLO meses presentes en ambos años."""
@@ -80,9 +99,26 @@ with st.sidebar:
     e_sel = st.multiselect("Entidad", options=entidades_opts, default=[], key="f_entidad")
     df_f = df4[df4["entidad"].isin(e_sel)] if e_sel else df4.copy()
 
+    # --- Controles de análisis visual ---
+    st.divider()
+    st.subheader("Análisis Visual")
+    mostrar_tendencia = st.checkbox("Línea de tendencia", value=False, key="toggle_tendencia")
+    mostrar_anomalias = st.checkbox("Detectar anomalías", value=False, key="toggle_anomalias")
+
+    threshold = 1.5
+    if mostrar_anomalias:
+        threshold = st.slider(
+            "Sensibilidad de detección",
+            min_value=1.0,
+            max_value=3.0,
+            value=1.5,
+            step=0.1,
+            help="Valores más bajos detectan más anomalías. 1.5=moderado, 2.0=estricto",
+            key="threshold_slider"
+        )
+
 # ---------- KPIs ----------
 st.subheader("Indicadores")
-
 # Total y promedio mensual (idéntico a tu lógica actual)
 total = len(df_f)
 prom  = df_f["fecha_mes"].value_counts().mean() if df_f["fecha_mes"].notna().any() else float("nan")
@@ -166,16 +202,13 @@ values = KpiValues(
 render_kpi_cards(
     values,
     labels=("Total Trámites", "Promedio Mensual", label_var),
-    emojis=("📊", "📈", "📉"),
     help_texts=(
         "Cantidad acumulada de trámites en el periodo filtrado.",
         "Promedio de trámites por mes.",
         "Variación respecto al periodo equivalente del año anterior.",
     ),
 )
-
 st.divider()
-
 
 # ---------- Serie mensual superpuesta por año ----------
 st.subheader("Evolución mensual por año (superpuesta)")
@@ -197,6 +230,17 @@ if df_f["anio"].notna().any() and df_f["mes_num"].notna().any():
     # columna de texto de mes para tooltip (evita lambda en format)
     serie["mes_nombre"] = serie["mes_num"].map(MESES_MAP)
 
+    # Detectar anomalías por año si está activado
+    if mostrar_anomalias:
+        serie["es_anomalia"] = False
+        for anio in years_for_grid:
+            mask_anio = serie["anio"] == anio
+            serie.loc[mask_anio, "es_anomalia"] = detect_peaks(
+                serie.loc[mask_anio, "tramites"], 
+                threshold=threshold
+            )
+
+    # Gráfico base
     chart = (
         alt.Chart(serie)
            .mark_line(point=True)
@@ -211,9 +255,70 @@ if df_f["anio"].notna().any() and df_f["mes_num"].notna().any():
                         alt.Tooltip("tramites:Q", title="Trámites")]
            )
            .properties(height=360)
-           .interactive()
     )
-    st.altair_chart(chart, use_container_width=True)
+
+    # Capa de anomalías
+    if mostrar_anomalias:
+        anomalias = serie[serie["es_anomalia"]]
+        if not anomalias.empty:
+            chart_anomalias = (
+                alt.Chart(anomalias)
+                   .mark_point(size=200, shape="diamond", filled=True)
+                   .encode(
+                       x=alt.X("mes_num:O"),
+                       y=alt.Y("tramites:Q"),
+                       color=alt.value("#FF4B4B"),
+                       tooltip=[
+                           alt.Tooltip("anio:O", title="Año"),
+                           alt.Tooltip("mes_nombre:N", title="Mes"),
+                           alt.Tooltip("tramites:Q", title="Trámites"),
+                           alt.Tooltip("es_anomalia:N", title="Anomalía")
+                       ]
+                   )
+            )
+            chart = chart + chart_anomalias
+
+    # Línea de tendencia por año (limitada al rango de datos)
+    if mostrar_tendencia:
+        tendencias = []
+        for anio in years_for_grid:
+            datos_anio = serie[serie["anio"] == anio].copy()
+            if len(datos_anio) >= 2:
+                # Calcular la regresión manualmente para controlar el rango
+
+
+                X = datos_anio["mes_num"].values.reshape(-1, 1)
+                y = datos_anio["tramites"].values
+
+                model = LinearRegression()
+                model.fit(X, y)
+
+                # Predecir solo para los meses que tienen datos
+                datos_anio["tendencia"] = model.predict(X)
+
+                chart_tendencia = (
+                    alt.Chart(datos_anio)
+                       .mark_line(strokeDash=[5, 5], size=2, opacity=0.6)
+                       .encode(
+                           x=alt.X("mes_num:O"),
+                           y=alt.Y("tendencia:Q"),
+                           color=alt.Color("anio:O", legend=None)
+                       )
+                )
+                tendencias.append(chart_tendencia)
+
+        for tend in tendencias:
+            chart = chart + tend
+
+    st.altair_chart(chart.interactive(), use_container_width=True)
+
+    # Mostrar resumen de anomalías si están activadas
+    if mostrar_anomalias and "es_anomalia" in serie.columns:
+        num_anomalias = serie["es_anomalia"].sum()
+        if num_anomalias > 0:
+            st.info(f"Se detectaron **{num_anomalias}** anomalías con threshold={threshold}")
+        else:
+            st.success(f"✅ No se detectaron anomalías con threshold={threshold}")
 else:
     st.info("No hay datos temporales para graficar.")
 
