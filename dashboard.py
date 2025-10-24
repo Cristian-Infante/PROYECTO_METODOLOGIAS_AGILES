@@ -7,6 +7,7 @@ import pandas as pd
 import altair as alt
 import pydeck as pdk
 import streamlit as st
+from components.kpis import render_kpi_cards, KpiValues
 
 # ---------- Config ----------
 st.set_page_config(page_title="Trámites Visibles", layout="wide")
@@ -81,26 +82,100 @@ with st.sidebar:
 
 # ---------- KPIs ----------
 st.subheader("Indicadores")
-c1, c2, c3 = st.columns(3)
 
+# Total y promedio mensual (idéntico a tu lógica actual)
 total = len(df_f)
 prom  = df_f["fecha_mes"].value_counts().mean() if df_f["fecha_mes"].notna().any() else float("nan")
 
-# Variación entre el primer y último año seleccionados (si hay >=2)
+# --- Variación robusta: escoger par de años con meses en común y base > 0 ---
 anios_con_datos = sorted(df_f["anio"].dropna().unique().astype(int).tolist())
-if len(anios_con_datos) >= 2:
-    y0, y1 = anios_con_datos[0], anios_con_datos[-1]
-    var = pct_change_between_two_years(df_f, y0, y1, meses_sel)
-    label_var = f"Variación {y0}→{y1}"
-else:
-    var = None
-    label_var = "Variación"
 
-c1.metric("Total",         f"{total:,}".replace(",", "."))
-c2.metric("Prom. mensual", f"{0 if math.isnan(prom) else round(prom):,}".replace(",", "."))
-c3.metric(label_var, "N/D" if var is None else f"{var:.1f}%")
+def _yoy_variation_robusta(d: pd.DataFrame, meses_sel: list[int] | None):
+    if d.empty or d["anio"].isna().all() or d["mes_num"].isna().all():
+        return None, None, None  # (var, y0, y1)
+
+    meses = list(meses_sel) if meses_sel else MESES_ORD
+
+    # Conteos por año/mes (solo meses válidos)
+    base = (
+        d[d["mes_num"].isin(meses)]
+        .groupby(["anio", "mes_num"], as_index=False)
+        .size()
+        .rename(columns={"size": "tramites"})
+    )
+    if base.empty:
+        return None, None, None
+
+    # Mapa de meses disponibles por año
+    meses_por_anio = (
+        base.groupby("anio")["mes_num"]
+            .apply(lambda s: set(s.astype(int).tolist()))
+            .to_dict()
+    )
+
+    # Intentar pares (y0, y1) con intersección de meses y base > 0
+    anios = sorted(meses_por_anio.keys())
+    mejor = None  # (var, y0, y1)
+    for y1 in reversed(anios):          # priorizar el más reciente como comparado
+        for y0 in anios:                # base
+            if y0 >= y1:
+                continue
+            inter = meses_por_anio[y0] & meses_por_anio[y1]
+            if not inter:
+                continue
+
+            a = int(base[(base["anio"] == y1) & (base["mes_num"].isin(inter))]["tramites"].sum())
+            b = int(base[(base["anio"] == y0) & (base["mes_num"].isin(inter))]["tramites"].sum())
+            if b == 0:
+                continue
+
+            var = (a - b) / b * 100.0
+            mejor = (var, y0, y1)
+            break
+        if mejor:
+            break
+
+    # Si no encontramos ningún par válido, intentar y1 vs y1-1 (año inmediato anterior)
+    if not mejor and len(anios) >= 2:
+        y1 = anios[-1]
+        y0 = y1 - 1
+        if y0 in meses_por_anio:
+            inter = meses_por_anio[y0] & meses_por_anio[y1]
+            if inter:
+                a = int(base[(base["anio"] == y1) & (base["mes_num"].isin(inter))]["tramites"].sum())
+                b = int(base[(base["anio"] == y0) & (base["mes_num"].isin(inter))]["tramites"].sum())
+                if b > 0:
+                    var = (a - b) / b * 100.0
+                    mejor = (var, y0, y1)
+
+    return mejor if mejor else (None, None, None)
+
+var, y0, y1 = _yoy_variation_robusta(df_f, meses_sel)
+label_var = f"Variación {y0}→{y1}" if (y0 is not None and y1 is not None) else "Variación Anual"
+
+
+# Empaquetar para el componente
+values = KpiValues(
+    total_tramites=total,
+    promedio_mensual=0 if (isinstance(prom, float) and math.isnan(prom)) else float(prom),
+    variacion_anual_pct=var if (var is not None and not (isinstance(var, float) and math.isnan(var))) else None,
+)
+
+
+# Renderizar 3 tarjetas con emojis y formato profesional
+render_kpi_cards(
+    values,
+    labels=("Total Trámites", "Promedio Mensual", label_var),
+    emojis=("📊", "📈", "📉"),
+    help_texts=(
+        "Cantidad acumulada de trámites en el periodo filtrado.",
+        "Promedio de trámites por mes.",
+        "Variación respecto al periodo equivalente del año anterior.",
+    ),
+)
 
 st.divider()
+
 
 # ---------- Serie mensual superpuesta por año ----------
 st.subheader("Evolución mensual por año (superpuesta)")
